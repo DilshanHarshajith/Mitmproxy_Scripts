@@ -78,7 +78,7 @@ class MitmLoader:
 
         count = 0
         for file_path in current_dir.glob("*.py"):
-            if file_path.name in excluded_files:
+            if (file_path.name in excluded_files) or (file_path.name.startswith("!"))  :
                 continue
 
             module_name = file_path.stem
