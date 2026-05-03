@@ -14,13 +14,48 @@ Use mitmproxy's --set flag to narrow the scope:
     --set media_out=./my_folder  # custom output directory
     --set media_min_size=1024    # skip files smaller than N bytes (default: 512)
 
+    --set media_domains=...      # domain filter with wildcard support (see below)
+
+Domain filtering (media_domains):
+    A comma-separated list of domain patterns.  When the option is empty (the
+    default) every host is captured.  Patterns are matched case-insensitively
+    against the request hostname (port is ignored).
+
+    Wildcards follow Unix shell-glob rules via fnmatch:
+        *   matches any sequence of characters within a label or across labels
+        ?   matches exactly one character
+
+    Prefix a pattern with ! to *exclude* that host even if another pattern
+    would otherwise allow it.  Exclusions are evaluated first.
+
+    Examples:
+        # Only capture from one exact host
+        --set media_domains=cdn.example.com
+
+        # Capture all subdomains of example.com (but not bare example.com)
+        --set media_domains="*.example.com"
+
+        # Capture bare domain AND all its subdomains
+        --set media_domains="example.com,*.example.com"
+
+        # Multiple unrelated domains
+        --set media_domains="*.example.com,static.other.net,img?.site.io"
+
+        # Allow all of example.com but skip its ads subdomain
+        --set media_domains="*.example.com,!ads.example.com"
+
+        # Block a specific CDN across all traffic (allow everything else)
+        --set media_domains="!tracking-cdn.net"
+
 Usage examples:
     mitmproxy -s media_extractor.py
     mitmproxy -s media_extractor.py --set media_types=pics
     mitmproxy -s media_extractor.py --set media_ext=jpg,gif,webp,mp4
+    mitmproxy -s media_extractor.py --set media_domains="*.example.com,!ads.example.com"
     mitmproxy -s script.py --set modules=media_extractor   # via loader
 """
 
+import fnmatch
 import hashlib
 import mimetypes
 import re
@@ -128,6 +163,60 @@ def _debug_log(message: str) -> None:
         pass
 
 
+def _parse_domain_patterns(raw: str) -> tuple[list[str], list[str]]:
+    """
+    Parse a comma-separated domain pattern string into two lists:
+      allow_patterns – plain patterns; if non-empty, a host must match at least one
+      block_patterns – patterns prefixed with '!'; a matching host is always skipped
+
+    Patterns are stored in lowercase; matching is case-insensitive.
+    An empty *raw* string produces two empty lists (= capture everything).
+    """
+    allow_patterns: list[str] = []
+    block_patterns: list[str] = []
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token.startswith("!"):
+            pat = token[1:].strip()
+            if pat:
+                block_patterns.append(pat)
+        else:
+            allow_patterns.append(token)
+    return allow_patterns, block_patterns
+
+
+def _host_from_flow(flow: http.HTTPFlow) -> str:
+    """Return the bare lowercase hostname (no port) for a flow's request."""
+    host = flow.request.host or ""
+    # flow.request.host normally has no port, but guard anyway
+    return host.split(":")[0].lower()
+
+
+def _domain_is_allowed(
+    host: str,
+    allow_patterns: list[str],
+    block_patterns: list[str],
+) -> bool:
+    """
+    Return True if *host* passes the domain filter.
+
+    Rules (evaluated in order):
+      1. If *host* matches any block pattern  → False  (blocked)
+      2. If allow_patterns is non-empty and *host* matches none → False  (not in allow list)
+      3. Otherwise                            → True   (allowed)
+
+    An empty allow_patterns + empty block_patterns means "allow everything".
+    """
+    for pat in block_patterns:
+        if fnmatch.fnmatch(host, pat):
+            return False
+    if allow_patterns:
+        return any(fnmatch.fnmatch(host, pat) for pat in allow_patterns)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Core extraction logic
 # ---------------------------------------------------------------------------
@@ -151,15 +240,23 @@ class MediaExtractor:
         allowed_extensions: frozenset[str],
         output_dir: Path,
         min_size: int,
+        allow_domains: list[str] | None = None,
+        block_domains: list[str] | None = None,
     ) -> None:
         self.allowed_extensions = allowed_extensions
         self.output_dir = output_dir
         self.min_size = min_size
+        self.allow_domains: list[str] = allow_domains or []
+        self.block_domains: list[str] = block_domains or []
         self._seen_hashes: set[str] = set()   # dedup within a session
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        domain_summary = (
+            f"allow={self.allow_domains or '*'}, block={self.block_domains or 'none'}"
+        )
         _debug_log(
             f"MediaExtractor ready — extensions={sorted(allowed_extensions)}, "
-            f"out={output_dir}, min_size={min_size}B"
+            f"out={output_dir}, min_size={min_size}B, domains=({domain_summary})"
         )
 
     # ------------------------------------------------------------------
@@ -170,6 +267,13 @@ class MediaExtractor:
         """Called for every HTTP response; saves qualifying media."""
         if not flow.response or not flow.response.content:
             return
+
+        # ── Domain filter ────────────────────────────────────────────────
+        host = _host_from_flow(flow)
+        if not _domain_is_allowed(host, self.allow_domains, self.block_domains):
+            _debug_log(f"Domain filtered: {host}")
+            return
+        # ─────────────────────────────────────────────────────────────────
 
         content_type = flow.response.headers.get("content-type", "").lower().split(";")[0].strip()
         url = flow.request.pretty_url
@@ -345,6 +449,19 @@ class MediaExtractorAddon:
 
     def load(self, loader) -> None:
         loader.add_option(
+            name="media_domains",
+            typespec=str,
+            default="",
+            help=(
+                "Comma-separated domain patterns to filter captures. "
+                "Empty (default) = capture from every host. "
+                "Supports fnmatch wildcards (* and ?). "
+                "Prefix a pattern with ! to block that host. "
+                "Block patterns are evaluated before allow patterns. "
+                "Example: '*.example.com,!ads.example.com'"
+            ),
+        )
+        loader.add_option(
             name="media_types",
             typespec=str,
             default="all",
@@ -384,7 +501,7 @@ class MediaExtractorAddon:
 
     def configure(self, updated) -> None:
         # Rebuild whenever any of our options change
-        if updated & {"media_types", "media_ext", "media_out", "media_min_size"}:
+        if updated & {"media_types", "media_ext", "media_out", "media_min_size", "media_domains"}:
             self._build_extractor()
 
     def response(self, flow: http.HTTPFlow) -> None:
@@ -400,21 +517,25 @@ class MediaExtractorAddon:
 
     def _build_extractor(self) -> None:
         try:
-            media_types = ctx.options.media_types
-            media_ext   = ctx.options.media_ext
-            media_out   = ctx.options.media_out
-            min_size    = ctx.options.media_min_size
+            media_types   = ctx.options.media_types
+            media_ext     = ctx.options.media_ext
+            media_out     = ctx.options.media_out
+            min_size      = ctx.options.media_min_size
+            media_domains = ctx.options.media_domains
         except AttributeError:
             # Called before options are available (e.g. during unit tests)
             return
 
         allowed = _resolve_allowed_extensions(media_types, media_ext)
         out_dir = Path(media_out).expanduser() if media_out else MEDIA_DIR
+        allow_domains, block_domains = _parse_domain_patterns(media_domains)
 
         self._extractor = MediaExtractor(
             allowed_extensions=allowed,
             output_dir=out_dir,
             min_size=min_size,
+            allow_domains=allow_domains,
+            block_domains=block_domains,
         )
 
 
