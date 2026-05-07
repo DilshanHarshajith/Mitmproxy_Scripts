@@ -314,14 +314,23 @@ class MediaExtractor:
     """
     Examines every completed HTTP response and saves media files to disk.
 
-    Directory layout:
+    Directory layout — default (no media_out set):
         <output_dir>/
           <YYYY-MM-DD>/
             <host>/
               images/
-                <filename_or_hash>.ext
+                <filename>.ext
               videos/
-                <filename_or_hash>.ext
+                <filename>.ext
+
+    Directory layout — user-specified output dir (media_out set):
+        <output_dir>/
+          images/
+            <host>/
+              <filename>.ext
+          videos/
+            <host>/
+              <filename>.ext
 
     Video streaming formats
     -----------------------
@@ -356,12 +365,14 @@ class MediaExtractor:
         min_size: int,
         allow_domains: list[str] | None = None,
         block_domains: list[str] | None = None,
+        custom_output: bool = False,
     ) -> None:
         self.allowed_extensions = allowed_extensions
         self.output_dir = output_dir
         self.min_size = min_size
         self.allow_domains: list[str] = allow_domains or []
         self.block_domains: list[str] = block_domains or []
+        self.custom_output = custom_output
         self._seen_hashes: set[str] = set()   # dedup within a session
 
         # HLS segment accumulation: stream_key → list of (index, url, data)
@@ -474,9 +485,12 @@ class MediaExtractor:
 
     def _save_m3u8(self, flow: http.HTTPFlow, url: str, body: bytes) -> None:
         """Save an HLS playlist as a text sidecar (not in the videos/ folder)."""
-        today = datetime.now().strftime("%Y-%m-%d")
         host = _safe_dirname(flow.request.host)
-        folder = self.output_dir / today / host / "hls_playlists"
+        if self.custom_output:
+            folder = self.output_dir / "hls_playlists" / host
+        else:
+            today = datetime.now().strftime("%Y-%m-%d")
+            folder = self.output_dir / today / host / "hls_playlists"
         folder.mkdir(parents=True, exist_ok=True)
 
         raw_name = Path(urlparse(url).path).stem
@@ -592,9 +606,14 @@ class MediaExtractor:
         digest: str,
     ) -> Path:
         """Compute the destination file path, avoiding name collisions."""
-        today = datetime.now().strftime("%Y-%m-%d")
         host = _safe_dirname(flow.request.host)
-        folder = self.output_dir / today / host / category
+        if self.custom_output:
+            # User-specified dir: images/<host>/ and videos/<host>/
+            folder = self.output_dir / category / host
+        else:
+            # Default layout: <YYYY-MM-DD>/<host>/<category>/
+            today = datetime.now().strftime("%Y-%m-%d")
+            folder = self.output_dir / today / host / category
         folder.mkdir(parents=True, exist_ok=True)
 
         # Try to use the original filename from the URL
@@ -797,6 +816,7 @@ class MediaExtractorAddon:
             min_size=min_size,
             allow_domains=allow_domains,
             block_domains=block_domains,
+            custom_output=bool(media_out),
         )
 
 
