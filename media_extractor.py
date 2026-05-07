@@ -59,6 +59,8 @@ import fnmatch
 import hashlib
 import mimetypes
 import re
+import struct
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -218,6 +220,93 @@ def _domain_is_allowed(
 
 
 # ---------------------------------------------------------------------------
+# Video stream helpers
+# ---------------------------------------------------------------------------
+
+def _hls_stream_key(url: str) -> str:
+    """
+    Derive a stable key that groups all .ts segments belonging to the same
+    HLS stream.  We strip the final path component (the segment filename)
+    so that e.g.
+        https://cdn.example.com/hls/stream1/seg001.ts
+        https://cdn.example.com/hls/stream1/seg002.ts
+    both map to  "cdn.example.com/hls/stream1".
+    """
+    parsed = urlparse(url)
+    parent = str(Path(parsed.path).parent).lstrip("/")
+    return f"{parsed.netloc}/{parent}"
+
+
+def _segment_index(url: str) -> int:
+    """
+    Extract an integer index from a segment URL so segments can be sorted
+    into the correct playback order even if they arrive out of order.
+
+    Tries, in order:
+      1. The last run of digits in the filename stem  (seg_0042.ts → 42)
+      2. 0 as a fallback (preserves insertion order for non-numbered names)
+    """
+    stem = Path(urlparse(url).path).stem
+    digits = re.findall(r"\d+", stem)
+    return int(digits[-1]) if digits else 0
+
+
+def _is_fmp4_init(data: bytes) -> bool:
+    """
+    Return True if *data* looks like an fMP4 initialisation segment.
+
+    An init segment contains a 'moov' box but no 'mdat' box.
+    Both box types are identified by their 4-byte type field at offset 4.
+    We scan for box headers rather than assuming a fixed layout.
+    """
+    has_moov = False
+    has_mdat = False
+    offset = 0
+    while offset + 8 <= len(data):
+        try:
+            box_size = struct.unpack_from(">I", data, offset)[0]
+            box_type = data[offset + 4: offset + 8]
+        except struct.error:
+            break
+        if box_type == b"moov":
+            has_moov = True
+        elif box_type == b"mdat":
+            has_mdat = True
+        if box_size < 8:
+            break
+        offset += box_size
+    return has_moov and not has_mdat
+
+
+def _is_fmp4_media_segment(data: bytes) -> bool:
+    """
+    Return True if *data* looks like an fMP4 media segment.
+
+    A media segment contains 'moof' + 'mdat' boxes (no 'moov').
+    """
+    has_moof = False
+    has_mdat = False
+    has_moov = False
+    offset = 0
+    while offset + 8 <= len(data):
+        try:
+            box_size = struct.unpack_from(">I", data, offset)[0]
+            box_type = data[offset + 4: offset + 8]
+        except struct.error:
+            break
+        if box_type == b"moof":
+            has_moof = True
+        elif box_type == b"mdat":
+            has_mdat = True
+        elif box_type == b"moov":
+            has_moov = True
+        if box_size < 8:
+            break
+        offset += box_size
+    return has_moof and has_mdat and not has_moov
+
+
+# ---------------------------------------------------------------------------
 # Core extraction logic
 # ---------------------------------------------------------------------------
 
@@ -233,6 +322,31 @@ class MediaExtractor:
                 <filename_or_hash>.ext
               videos/
                 <filename_or_hash>.ext
+
+    Video streaming formats
+    -----------------------
+    HLS (.m3u8 / .ts):
+        Modern video is typically delivered via HTTP Live Streaming.  The
+        .m3u8 playlist is a text manifest — not a video — and each .ts file
+        is only a short segment (~2–10 s).  Saving them individually produces
+        unplayable fragments.
+
+        Fix: .ts segments are buffered per-stream (keyed by host + URL
+        directory) and written out as a single concatenated .ts file once the
+        stream is flushed.  Call flush_streams() at the end of a capture
+        session to finalise any in-progress streams.  .m3u8 files are saved
+        as metadata only (not in the videos/ folder) so they don't appear as
+        broken video files.
+
+    Fragmented MP4 (fMP4 / CMAF / DASH):
+        Many MP4 streams split video into an initialisation segment (contains
+        codec/track metadata, no media data) and media segments (contain
+        frames but no codec metadata).  Playing a media segment without its
+        init segment yields a blank/unplayable file.
+
+        Fix: init segments are detected via ISO BMFF box scanning and cached
+        per host.  When a media segment arrives its init data is prepended
+        before writing, producing a self-contained, playable MP4.
     """
 
     def __init__(
@@ -249,6 +363,15 @@ class MediaExtractor:
         self.allow_domains: list[str] = allow_domains or []
         self.block_domains: list[str] = block_domains or []
         self._seen_hashes: set[str] = set()   # dedup within a session
+
+        # HLS segment accumulation: stream_key → list of (index, url, data)
+        self._hls_streams: dict[str, list[tuple[int, str, bytes]]] = defaultdict(list)
+        # HLS stream metadata: stream_key → (flow_snapshot, category)
+        self._hls_meta: dict[str, tuple] = {}
+
+        # fMP4 init segment cache: host → init_bytes
+        self._fmp4_init: dict[str, bytes] = {}
+
         output_dir.mkdir(parents=True, exist_ok=True)
 
         domain_summary = (
@@ -290,7 +413,37 @@ class MediaExtractor:
             _debug_log(f"Skipping {url} — body too small ({len(body)}B)")
             return
 
-        # Deduplicate by content hash
+        # ── HLS playlist (.m3u8) ─────────────────────────────────────────
+        # Save as a sidecar text file in an "hls_playlists" subfolder rather
+        # than in videos/ where players would try (and fail) to open it.
+        if ext == "m3u8":
+            self._save_m3u8(flow, url, body)
+            return
+
+        # ── HLS transport-stream segment (.ts) ───────────────────────────
+        if ext == "ts":
+            self._buffer_ts_segment(flow, url, body, category)
+            return
+
+        # ── Fragmented MP4 init segment ───────────────────────────────────
+        if ext in ("mp4", "m4v") and _is_fmp4_init(body):
+            self._fmp4_init[host] = body
+            _debug_log(f"Cached fMP4 init segment from {host} ({len(body):,}B)")
+            return
+
+        # ── Fragmented MP4 media segment ──────────────────────────────────
+        if ext in ("mp4", "m4v") and _is_fmp4_media_segment(body):
+            init = self._fmp4_init.get(host)
+            if init:
+                body = init + body
+                _debug_log(f"Prepended fMP4 init to media segment from {host}")
+            else:
+                _debug_log(
+                    f"fMP4 media segment from {host} has no cached init — "
+                    "file may be unplayable. Init segment may not have been intercepted yet."
+                )
+
+        # ── Regular / non-streaming media ────────────────────────────────
         digest = hashlib.md5(body, usedforsecurity=False).hexdigest()
         if digest in self._seen_hashes:
             _debug_log(f"Duplicate skipped: {url}")
@@ -302,6 +455,106 @@ class MediaExtractor:
 
         client_ip = _get_client_ip(flow)
         _debug_log(f"Saved {category}/{ext} from {client_ip} → {dest.name} ({len(body):,}B)")
+
+    def flush_streams(self) -> None:
+        """
+        Concatenate and write out all buffered HLS streams.
+
+        Call this at the end of a capture session (e.g. from the addon's
+        `done` hook) to ensure partially-captured streams are flushed to disk.
+        """
+        for key, segments in list(self._hls_streams.items()):
+            self._flush_hls_stream(key, segments)
+        self._hls_streams.clear()
+        self._hls_meta.clear()
+
+    # ------------------------------------------------------------------
+    # HLS helpers
+    # ------------------------------------------------------------------
+
+    def _save_m3u8(self, flow: http.HTTPFlow, url: str, body: bytes) -> None:
+        """Save an HLS playlist as a text sidecar (not in the videos/ folder)."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        host = _safe_dirname(flow.request.host)
+        folder = self.output_dir / today / host / "hls_playlists"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        raw_name = Path(urlparse(url).path).stem
+        safe_name = re.sub(r"[^\w\-.]", "_", raw_name)[:80] or "playlist"
+        dest = folder / f"{safe_name}.m3u8"
+        if dest.exists():
+            digest = hashlib.md5(body, usedforsecurity=False).hexdigest()
+            dest = folder / f"{safe_name}_{digest[:8]}.m3u8"
+
+        self._atomic_write(dest, body)
+        _debug_log(f"Saved HLS playlist → {dest.name}")
+
+    def _buffer_ts_segment(
+        self,
+        flow: http.HTTPFlow,
+        url: str,
+        body: bytes,
+        category: str,
+    ) -> None:
+        """
+        Buffer a .ts segment for later concatenation.
+
+        Segments are grouped by stream key (host + URL directory) so that
+        segments from different streams don't get mixed together.
+        """
+        key = _hls_stream_key(url)
+        idx = _segment_index(url)
+        self._hls_streams[key].append((idx, url, body))
+
+        # Store flow metadata the first time we see this stream
+        if key not in self._hls_meta:
+            self._hls_meta[key] = (flow, category)
+
+        _debug_log(
+            f"Buffered HLS segment #{idx} for stream '{key}' "
+            f"({len(body):,}B, total {len(self._hls_streams[key])} segments)"
+        )
+
+    def _flush_hls_stream(
+        self,
+        key: str,
+        segments: list[tuple[int, str, bytes]],
+    ) -> None:
+        """Sort and concatenate all buffered segments for one stream, then write."""
+        if not segments:
+            return
+
+        meta = self._hls_meta.get(key)
+        if meta is None:
+            _debug_log(f"No metadata for HLS stream '{key}' — skipping flush")
+            return
+
+        flow, category = meta
+
+        # Sort by the numeric index embedded in each segment's URL
+        segments.sort(key=lambda t: t[0])
+        combined = b"".join(data for _, _, data in segments)
+
+        # Use the URL of the first segment to derive an output filename
+        first_url = segments[0][1]
+        digest = hashlib.md5(combined, usedforsecurity=False).hexdigest()
+
+        if digest in self._seen_hashes:
+            _debug_log(f"HLS stream '{key}' already saved — skipping")
+            return
+        self._seen_hashes.add(digest)
+
+        dest = self._build_dest_path(flow, first_url, "ts", category, digest)
+        # Rename to reflect that this is the merged stream
+        stem = dest.stem
+        dest = dest.with_name(f"{stem}_merged.ts")
+
+        self._atomic_write(dest, combined)
+        client_ip = _get_client_ip(flow)
+        _debug_log(
+            f"Flushed HLS stream '{key}': {len(segments)} segments → "
+            f"{dest.name} ({len(combined):,}B) from {client_ip}"
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -510,6 +763,14 @@ class MediaExtractorAddon:
                 self._extractor.handle_response(flow)
             except Exception as exc:
                 _debug_log(f"Unhandled error in response hook: {exc}")
+
+    def done(self) -> None:
+        """Flush any buffered HLS streams when mitmproxy shuts down."""
+        if self._extractor:
+            try:
+                self._extractor.flush_streams()
+            except Exception as exc:
+                _debug_log(f"Error flushing HLS streams on done: {exc}")
 
     # ------------------------------------------------------------------
     # Internal
