@@ -11,8 +11,15 @@ Use mitmproxy's --set flag to narrow the scope:
     --set media_types=vids       # videos only
     --set media_types=all        # both (default)
     --set media_ext=jpg,png,mp4  # specific extensions (overrides media_types)
-    --set media_out=./my_folder  # custom output directory
+    --set media_out=./my_folder  # custom output directory — files are written
+                                 # directly into images/ and videos/ with no
+                                 # per-site sub-folders (flat layout)
     --set media_min_size=1024    # skip files smaller than N bytes (default: 512)
+                                 # also accepts human-readable suffixes:
+                                 #   512B  →  512 bytes
+                                 #   10KB  →  10 240 bytes
+                                 #   1MB   →  1 048 576 bytes
+                                 #   0.5GB →  536 870 912 bytes
 
     --set media_domains=...      # domain filter with wildcard support (see below)
 
@@ -76,6 +83,56 @@ except ImportError:
     DEBUG_LOG = OUT_DIR / "Other" / "debug.log"
 
 MEDIA_DIR = OUT_DIR / "Media"
+
+# ---------------------------------------------------------------------------
+# Pre-compiled regexes (avoids repeated compilation on hot paths)
+# ---------------------------------------------------------------------------
+_RE_SAFE_NAME  = re.compile(r"[^\w\-.]")
+_RE_SAFE_DIR   = re.compile(r"[^\w\-.]")
+_RE_DIGITS     = re.compile(r"\d+")
+_RE_SIZE_SUFFIX = re.compile(
+    r"^\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTP]I?B|B)?\s*$",
+    re.IGNORECASE,
+)
+
+_SIZE_UNITS: dict[str, int] = {
+    "b":   1,
+    "kb":  1_024,
+    "kib": 1_024,
+    "mb":  1_024 ** 2,
+    "mib": 1_024 ** 2,
+    "gb":  1_024 ** 3,
+    "gib": 1_024 ** 3,
+    "tb":  1_024 ** 4,
+    "tib": 1_024 ** 4,
+    "pb":  1_024 ** 5,
+    "pib": 1_024 ** 5,
+}
+
+
+def _parse_min_size(raw: str | int) -> int:
+    """
+    Convert a size value to bytes.
+
+    Accepts:
+      - plain int or str of digits → bytes directly
+      - human-readable strings: "512B", "10KB", "1.5MB", "2GiB", …
+        (case-insensitive; both SI-prefix "KB" and IEC "KiB" are treated as
+        powers of 1024 for simplicity)
+
+    Raises ValueError on unrecognisable input.
+    """
+    if isinstance(raw, int):
+        return max(0, raw)
+
+    raw = str(raw).strip()
+    m = _RE_SIZE_SUFFIX.match(raw)
+    if not m:
+        raise ValueError(f"Cannot parse size value: {raw!r}")
+
+    value = float(m.group("value"))
+    unit  = (m.group("unit") or "b").lower()
+    return int(value * _SIZE_UNITS[unit])
 
 # ---------------------------------------------------------------------------
 # Extension sets
@@ -247,7 +304,7 @@ def _segment_index(url: str) -> int:
       2. 0 as a fallback (preserves insertion order for non-numbered names)
     """
     stem = Path(urlparse(url).path).stem
-    digits = re.findall(r"\d+", stem)
+    digits = _RE_DIGITS.findall(stem)
     return int(digits[-1]) if digits else 0
 
 
@@ -323,14 +380,14 @@ class MediaExtractor:
               videos/
                 <filename>.ext
 
-    Directory layout — user-specified output dir (media_out set):
+    Directory layout — user-specified output dir (media_out set, flat):
         <output_dir>/
           images/
-            <host>/
-              <filename>.ext
+            <filename>.ext          ← no per-site sub-folder
           videos/
-            <host>/
-              <filename>.ext
+            <filename>.ext
+          hls_playlists/
+            <playlist>.m3u8
 
     Video streaming formats
     -----------------------
@@ -399,7 +456,8 @@ class MediaExtractor:
 
     def handle_response(self, flow: http.HTTPFlow) -> None:
         """Called for every HTTP response; saves qualifying media."""
-        if not flow.response or not flow.response.content:
+        resp = flow.response
+        if not resp or not resp.content:
             return
 
         # ── Domain filter ────────────────────────────────────────────────
@@ -409,24 +467,22 @@ class MediaExtractor:
             return
         # ─────────────────────────────────────────────────────────────────
 
-        content_type = flow.response.headers.get("content-type", "").lower().split(";")[0].strip()
+        content_type = resp.headers.get("content-type", "").lower().split(";")[0].strip()
         url = flow.request.pretty_url
 
         ext, category = self._resolve_ext_and_category(url, content_type)
-        if ext is None:
+        if ext is None or ext not in self.allowed_extensions:
             return  # not a media type we care about
 
-        if ext not in self.allowed_extensions:
+        # Size check before copying the body into a local variable
+        content_length = len(resp.content)
+        if content_length < self.min_size:
+            _debug_log(f"Skipping {url} — body too small ({content_length}B < {self.min_size}B)")
             return
 
-        body = flow.response.content
-        if len(body) < self.min_size:
-            _debug_log(f"Skipping {url} — body too small ({len(body)}B)")
-            return
+        body = resp.content  # single reference; no extra copy
 
         # ── HLS playlist (.m3u8) ─────────────────────────────────────────
-        # Save as a sidecar text file in an "hls_playlists" subfolder rather
-        # than in videos/ where players would try (and fail) to open it.
         if ext == "m3u8":
             self._save_m3u8(flow, url, body)
             return
@@ -455,6 +511,7 @@ class MediaExtractor:
                 )
 
         # ── Regular / non-streaming media ────────────────────────────────
+        # Compute hash once; reuse for both dedup check and filename suffix.
         digest = hashlib.md5(body, usedforsecurity=False).hexdigest()
         if digest in self._seen_hashes:
             _debug_log(f"Duplicate skipped: {url}")
@@ -485,16 +542,16 @@ class MediaExtractor:
 
     def _save_m3u8(self, flow: http.HTTPFlow, url: str, body: bytes) -> None:
         """Save an HLS playlist as a text sidecar (not in the videos/ folder)."""
-        host = _safe_dirname(flow.request.host)
         if self.custom_output:
-            folder = self.output_dir / "hls_playlists" / host
+            folder = self.output_dir / "hls_playlists"
         else:
+            host  = _safe_dirname(flow.request.host)
             today = datetime.now().strftime("%Y-%m-%d")
             folder = self.output_dir / today / host / "hls_playlists"
         folder.mkdir(parents=True, exist_ok=True)
 
-        raw_name = Path(urlparse(url).path).stem
-        safe_name = re.sub(r"[^\w\-.]", "_", raw_name)[:80] or "playlist"
+        raw_name  = Path(urlparse(url).path).stem
+        safe_name = _RE_SAFE_NAME.sub("_", raw_name)[:80] or "playlist"
         dest = folder / f"{safe_name}.m3u8"
         if dest.exists():
             digest = hashlib.md5(body, usedforsecurity=False).hexdigest()
@@ -605,20 +662,26 @@ class MediaExtractor:
         category: str,
         digest: str,
     ) -> Path:
-        """Compute the destination file path, avoiding name collisions."""
-        host = _safe_dirname(flow.request.host)
+        """Compute the destination file path, avoiding name collisions.
+
+        Layout when *media_out* is provided (flat — no per-site folder):
+            <output_dir>/<category>/<filename>.ext
+
+        Default layout (no *media_out*):
+            <output_dir>/<YYYY-MM-DD>/<host>/<category>/<filename>.ext
+        """
         if self.custom_output:
-            # User-specified dir: images/<host>/ and videos/<host>/
-            folder = self.output_dir / category / host
+            # Flat layout: group only by media category, not by site
+            folder = self.output_dir / category
         else:
-            # Default layout: <YYYY-MM-DD>/<host>/<category>/
+            host  = _safe_dirname(flow.request.host)
             today = datetime.now().strftime("%Y-%m-%d")
             folder = self.output_dir / today / host / category
         folder.mkdir(parents=True, exist_ok=True)
 
         # Try to use the original filename from the URL
-        raw_name = Path(urlparse(url).path).stem
-        safe_name = re.sub(r"[^\w\-.]", "_", raw_name)[:80] or "media"
+        raw_name  = Path(urlparse(url).path).stem
+        safe_name = _RE_SAFE_NAME.sub("_", raw_name)[:80] or "media"
         candidate = folder / f"{safe_name}.{ext}"
 
         # If the name is already taken (different content), append part of the hash
@@ -673,7 +736,7 @@ def _category_for_ext(ext: str) -> str | None:
 
 def _safe_dirname(name: str) -> str:
     """Sanitise a hostname so it can be used as a directory name."""
-    return re.sub(r"[^\w\-.]", "_", name)[:100] or "unknown_host"
+    return _RE_SAFE_DIR.sub("_", name)[:100] or "unknown_host"
 
 
 def _parse_ext_arg(raw: str) -> frozenset[str]:
@@ -763,9 +826,13 @@ class MediaExtractorAddon:
         )
         loader.add_option(
             name="media_min_size",
-            typespec=int,
-            default=512,
-            help="Minimum response body size in bytes to save (default: 512).",
+            typespec=str,
+            default="512",
+            help=(
+                "Minimum response body size to save. "
+                "Accepts plain bytes or human-readable suffixes: "
+                "512B, 10KB, 1.5MB, 2GiB … (default: 512)."
+            ),
         )
 
     def running(self) -> None:
@@ -800,7 +867,6 @@ class MediaExtractorAddon:
             media_types   = ctx.options.media_types
             media_ext     = ctx.options.media_ext
             media_out     = ctx.options.media_out
-            min_size      = ctx.options.media_min_size
             media_domains = ctx.options.media_domains
         except AttributeError:
             # Called before options are available (e.g. during unit tests)
@@ -809,6 +875,12 @@ class MediaExtractorAddon:
         allowed = _resolve_allowed_extensions(media_types, media_ext)
         out_dir = Path(media_out).expanduser() if media_out else MEDIA_DIR
         allow_domains, block_domains = _parse_domain_patterns(media_domains)
+
+        try:
+            min_size = _parse_min_size(ctx.options.media_min_size)
+        except ValueError as exc:
+            _debug_log(f"Invalid media_min_size value — falling back to 512B: {exc}")
+            min_size = 512
 
         self._extractor = MediaExtractor(
             allowed_extensions=allowed,
