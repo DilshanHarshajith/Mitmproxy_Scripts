@@ -13,7 +13,9 @@ Use mitmproxy's --set flag to narrow the scope:
     --set media_ext=jpg,png,mp4  # specific extensions (overrides media_types)
     --set media_out=./my_folder  # custom output directory — files are written
                                  # directly into images/ and videos/ with no
-                                 # per-site sub-folders (flat layout)
+                                 # per-site sub-folders (flat layout). If only
+                                 # one media type is selected, sub-folders are
+                                 # omitted and files are dumped directly.
     --set media_min_size=1024    # skip files smaller than N bytes (default: 512)
                                  # also accepts human-readable suffixes:
                                  #   512B  →  512 bytes
@@ -382,9 +384,9 @@ class MediaExtractor:
 
     Directory layout — user-specified output dir (media_out set, flat):
         <output_dir>/
-          images/
-            <filename>.ext          ← no per-site sub-folder
-          videos/
+          images/                   ← sub-folders created only if both media
+            <filename>.ext          ← types are allowed. Otherwise dumped directly
+          videos/                   ← into <output_dir>
             <filename>.ext
           hls_playlists/
             <playlist>.m3u8
@@ -430,6 +432,11 @@ class MediaExtractor:
         self.allow_domains: list[str] = allow_domains or []
         self.block_domains: list[str] = block_domains or []
         self.custom_output = custom_output
+
+        has_images = not allowed_extensions.isdisjoint(IMAGE_EXTENSIONS)
+        has_videos = not allowed_extensions.isdisjoint(VIDEO_EXTENSIONS)
+        self.split_by_category = has_images and has_videos
+
         self._seen_hashes: set[str] = set()   # dedup within a session
 
         # HLS segment accumulation: stream_key → list of (index, url, data)
@@ -543,7 +550,10 @@ class MediaExtractor:
     def _save_m3u8(self, flow: http.HTTPFlow, url: str, body: bytes) -> None:
         """Save an HLS playlist as a text sidecar (not in the videos/ folder)."""
         if self.custom_output:
-            folder = self.output_dir / "hls_playlists"
+            if self.split_by_category:
+                folder = self.output_dir / "hls_playlists"
+            else:
+                folder = self.output_dir
         else:
             host  = _safe_dirname(flow.request.host)
             today = datetime.now().strftime("%Y-%m-%d")
@@ -672,7 +682,10 @@ class MediaExtractor:
         """
         if self.custom_output:
             # Flat layout: group only by media category, not by site
-            folder = self.output_dir / category
+            if self.split_by_category:
+                folder = self.output_dir / category
+            else:
+                folder = self.output_dir
         else:
             host  = _safe_dirname(flow.request.host)
             today = datetime.now().strftime("%Y-%m-%d")
